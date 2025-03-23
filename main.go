@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -16,21 +17,118 @@ import (
 	"github.com/withObsrvr/pluginapi"
 )
 
+// ErrorType categorizes the type of error for better handling
+type ErrorType string
+
+const (
+	ErrorTypeConfig      ErrorType = "config"
+	ErrorTypeProcessing  ErrorType = "processing"
+	ErrorTypeParsing     ErrorType = "parsing"
+	ErrorTypeConsumer    ErrorType = "consumer"
+	ErrorTypeUnsupported ErrorType = "unsupported"
+)
+
+// ErrorSeverity indicates how serious an error is
+type ErrorSeverity string
+
+const (
+	ErrorSeverityFatal   ErrorSeverity = "fatal"
+	ErrorSeverityError   ErrorSeverity = "error"
+	ErrorSeverityWarning ErrorSeverity = "warning"
+)
+
+// ProcessorError implements a rich error type for better error handling
+type ProcessorError struct {
+	Err             error                  // Original error
+	Type            ErrorType              // Category of error
+	Severity        ErrorSeverity          // How serious the error is
+	TransactionHash string                 // Transaction context
+	LedgerSequence  uint32                 // Ledger context
+	ContractID      string                 // Contract context
+	Context         map[string]interface{} // Additional metadata
+}
+
+// NewProcessorError creates a new processor error with the given parameters
+func NewProcessorError(err error, errType ErrorType, severity ErrorSeverity) *ProcessorError {
+	return &ProcessorError{
+		Err:      err,
+		Type:     errType,
+		Severity: severity,
+		Context:  make(map[string]interface{}),
+	}
+}
+
+// Error implements the error interface
+func (e *ProcessorError) Error() string {
+	parts := []string{fmt.Sprintf("[%s:%s] %v", e.Type, e.Severity, e.Err)}
+
+	if e.LedgerSequence > 0 {
+		parts = append(parts, fmt.Sprintf("ledger=%d", e.LedgerSequence))
+	}
+
+	if e.TransactionHash != "" {
+		parts = append(parts, fmt.Sprintf("tx=%s", e.TransactionHash))
+	}
+
+	if e.ContractID != "" {
+		parts = append(parts, fmt.Sprintf("contract=%s", e.ContractID))
+	}
+
+	for k, v := range e.Context {
+		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
+	}
+
+	return strings.Join(parts, " ")
+}
+
+// WithLedger adds ledger sequence context to the error
+func (e *ProcessorError) WithLedger(sequence uint32) *ProcessorError {
+	e.LedgerSequence = sequence
+	return e
+}
+
+// WithTransaction adds transaction hash context to the error
+func (e *ProcessorError) WithTransaction(hash string) *ProcessorError {
+	e.TransactionHash = hash
+	return e
+}
+
+// WithContract adds contract ID context to the error
+func (e *ProcessorError) WithContract(id string) *ProcessorError {
+	e.ContractID = id
+	return e
+}
+
+// WithContext adds additional context to the error
+func (e *ProcessorError) WithContext(key string, value interface{}) *ProcessorError {
+	e.Context[key] = value
+	return e
+}
+
 // ContractInvocation represents a contract invocation event
 type ContractInvocation struct {
-	Timestamp        time.Time         `json:"timestamp"`
-	LedgerSequence   uint32            `json:"ledger_sequence"`
-	TransactionHash  string            `json:"transaction_hash"`
-	ContractID       string            `json:"contract_id"`
-	InvokingAccount  string            `json:"invoking_account"`
-	FunctionName     string            `json:"function_name"`
+	// Transaction context
+	Timestamp       time.Time `json:"timestamp"`
+	LedgerSequence  uint32    `json:"ledger_sequence"`
+	TransactionHash string    `json:"transaction_hash"`
+	TransactionID   int64     `json:"transaction_id"`
+
+	// Invocation context
+	ContractID      string `json:"contract_id"`
+	InvokingAccount string `json:"invoking_account"`
+	FunctionName    string `json:"function_name"`
+	Successful      bool   `json:"successful"`
+
+	// Invocation details
 	Arguments        []json.RawMessage `json:"arguments,omitempty"`
-	Successful       bool              `json:"successful"`
 	DiagnosticEvents []DiagnosticEvent `json:"diagnostic_events,omitempty"`
 	ContractCalls    []ContractCall    `json:"contract_calls,omitempty"`
 	StateChanges     []StateChange     `json:"state_changes,omitempty"`
 	TtlExtensions    []TtlExtension    `json:"ttl_extensions,omitempty"`
 	TemporaryData    []TemporaryData   `json:"temporary_data,omitempty"`
+
+	// Searchable tags for filtering
+	Tags map[string]string `json:"tags,omitempty"`
 }
 
 // DiagnosticEvent represents a diagnostic event emitted during contract execution
@@ -77,24 +175,32 @@ type TemporaryData struct {
 	ArgValues   []json.RawMessage `json:"arg_values,omitempty"`   // Values of related arguments
 }
 
+// ProcessorStats contains operational metrics for the processor
+type ProcessorStats struct {
+	ProcessedLedgers  uint32    `json:"processed_ledgers"`
+	InvocationsFound  uint64    `json:"invocations_found"`
+	SuccessfulInvokes uint64    `json:"successful_invokes"`
+	FailedInvokes     uint64    `json:"failed_invokes"`
+	LastLedger        uint32    `json:"last_ledger"`
+	LastProcessedTime time.Time `json:"last_processed_time"`
+	StartTime         time.Time `json:"start_time"`
+}
+
 // ContractInvocationProcessor implements the pluginapi.Processor and pluginapi.Consumer interfaces
 type ContractInvocationProcessor struct {
 	consumers         []pluginapi.Consumer
 	networkPassphrase string
 	mu                sync.RWMutex
-	stats             struct {
-		ProcessedLedgers  uint32
-		InvocationsFound  uint64
-		SuccessfulInvokes uint64
-		FailedInvokes     uint64
-		LastLedger        uint32
-		LastProcessedTime time.Time
-	}
+	stats             ProcessorStats
 }
 
 // New creates a new instance of the plugin
 func New() pluginapi.Plugin {
-	return &ContractInvocationProcessor{}
+	return &ContractInvocationProcessor{
+		stats: ProcessorStats{
+			StartTime: time.Now(),
+		},
+	}
 }
 
 // Name returns the name of the plugin
@@ -116,7 +222,17 @@ func (p *ContractInvocationProcessor) Type() pluginapi.PluginType {
 func (p *ContractInvocationProcessor) Initialize(config map[string]interface{}) error {
 	networkPassphrase, ok := config["network_passphrase"].(string)
 	if !ok {
-		return fmt.Errorf("missing network_passphrase in configuration")
+		return NewProcessorError(
+			errors.New("missing network_passphrase in configuration"),
+			ErrorTypeConfig,
+			ErrorSeverityFatal,
+		)
+	}
+
+	// Check for API version compatibility
+	if apiVersion, ok := config["flow_api_version"].(string); ok {
+		log.Printf("Flow API Version: %s", apiVersion)
+		// Could implement version compatibility check here
 	}
 
 	p.networkPassphrase = networkPassphrase
@@ -126,16 +242,32 @@ func (p *ContractInvocationProcessor) Initialize(config map[string]interface{}) 
 
 // RegisterConsumer implements the ConsumerRegistry interface
 func (p *ContractInvocationProcessor) RegisterConsumer(consumer pluginapi.Consumer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	log.Printf("Registering consumer with ContractInvocationProcessor: %s", consumer.Name())
 	p.consumers = append(p.consumers, consumer)
-	log.Printf("Registered consumer with ContractInvocationProcessor: %s", consumer.Name())
 }
 
 // Process handles incoming messages (implements pluginapi.Processor)
 func (p *ContractInvocationProcessor) Process(ctx context.Context, msg pluginapi.Message) error {
-	// Check if this is a ledger close meta
+	// Check for context cancellation first
+	if err := ctx.Err(); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("context canceled before processing: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		)
+	}
+
+	// Type assertion with improved error handling
 	ledgerCloseMeta, ok := msg.Payload.(xdr.LedgerCloseMeta)
 	if !ok {
-		return fmt.Errorf("expected xdr.LedgerCloseMeta payload, got %T", msg.Payload)
+		return NewProcessorError(
+			fmt.Errorf("expected xdr.LedgerCloseMeta payload, got %T", msg.Payload),
+			ErrorTypeUnsupported,
+			ErrorSeverityError,
+		)
 	}
 
 	sequence := ledgerCloseMeta.LedgerSequence()
@@ -143,32 +275,98 @@ func (p *ContractInvocationProcessor) Process(ctx context.Context, msg pluginapi
 
 	txReader, err := ingest.NewLedgerTransactionReaderFromLedgerCloseMeta(p.networkPassphrase, ledgerCloseMeta)
 	if err != nil {
-		return fmt.Errorf("error creating transaction reader: %w", err)
+		return NewProcessorError(
+			fmt.Errorf("error creating transaction reader: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityError,
+		).WithLedger(sequence)
 	}
 	defer txReader.Close()
 
 	// Process each transaction
 	for {
+		// Use a timeout context for each transaction
+		_, cancel := context.WithTimeout(ctx, 10*time.Second)
 		tx, err := txReader.Read()
+		cancel() // Always cancel to prevent context leak
+
 		if err == io.EOF {
 			break
 		}
+
 		if err != nil {
-			return fmt.Errorf("error reading transaction: %w", err)
+			// Continue processing despite transaction read errors
+			procErr := NewProcessorError(
+				fmt.Errorf("error reading transaction: %w", err),
+				ErrorTypeProcessing,
+				ErrorSeverityWarning,
+			).WithLedger(sequence)
+			log.Printf("Warning: %s", procErr.Error())
+			continue
 		}
+
+		txHash := tx.Result.TransactionHash.HexString()
 
 		// Check each operation for contract invocations
 		for opIndex, op := range tx.Envelope.Operations() {
 			if op.Body.Type == xdr.OperationTypeInvokeHostFunction {
-				invocation, err := p.processContractInvocation(tx, opIndex, op, ledgerCloseMeta)
+				// Use a timeout context for each invocation processing
+				invCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				invocation, err := p.processContractInvocation(invCtx, tx, opIndex, op, ledgerCloseMeta)
+				cancel() // Always cancel to prevent context leak
+
 				if err != nil {
-					log.Printf("Error processing contract invocation: %v", err)
+					var procErr *ProcessorError
+					if !errors.As(err, &procErr) {
+						// Wrap if not already a ProcessorError
+						procErr = NewProcessorError(
+							err,
+							ErrorTypeProcessing,
+							ErrorSeverityWarning,
+						)
+					}
+
+					procErr.WithLedger(sequence).WithTransaction(txHash)
+					log.Printf("Error processing contract invocation: %s", procErr.Error())
+
+					p.mu.Lock()
+					p.stats.FailedInvokes++
+					p.mu.Unlock()
 					continue
 				}
 
 				if invocation != nil {
-					if err := p.forwardToConsumers(ctx, invocation); err != nil {
-						log.Printf("Error forwarding invocation: %v", err)
+					log.Printf("Found contract invocation for contract ID: %s, function: %s",
+						invocation.ContractID, invocation.FunctionName)
+
+					p.mu.Lock()
+					p.stats.InvocationsFound++
+					if invocation.Successful {
+						p.stats.SuccessfulInvokes++
+					}
+					p.mu.Unlock()
+
+					// Forward with a timeout context
+					fwdCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+					err := p.forwardToConsumers(fwdCtx, invocation)
+					cancel() // Always cancel to prevent context leak
+
+					if err != nil {
+						var procErr *ProcessorError
+						if !errors.As(err, &procErr) {
+							// Wrap if not already a ProcessorError
+							procErr = NewProcessorError(
+								err,
+								ErrorTypeConsumer,
+								ErrorSeverityWarning,
+							)
+						}
+
+						procErr.WithLedger(sequence).
+							WithTransaction(txHash).
+							WithContract(invocation.ContractID)
+
+						log.Printf("Error forwarding invocation: %s", procErr.Error())
 					}
 				}
 			}
@@ -184,198 +382,70 @@ func (p *ContractInvocationProcessor) Process(ctx context.Context, msg pluginapi
 	return nil
 }
 
-func (p *ContractInvocationProcessor) processContractInvocation(
-	tx ingest.LedgerTransaction,
-	opIndex int,
-	op xdr.Operation,
-	meta xdr.LedgerCloseMeta,
-) (*ContractInvocation, error) {
-	// Use the correct method to access the invoke host function operation
-	invokeHostFunction := op.Body.InvokeHostFunctionOp
-
-	// Get the invoking account
-	var invokingAccount xdr.AccountId
-	if op.SourceAccount != nil {
-		invokingAccount = op.SourceAccount.ToAccountId()
-	} else {
-		invokingAccount = tx.Envelope.SourceAccount().ToAccountId()
-	}
-
-	// Get contract ID if available
-	var contractID string
-	var functionName string
-	var arguments []json.RawMessage
-
-	if function := invokeHostFunction.HostFunction; function.Type == xdr.HostFunctionTypeHostFunctionTypeInvokeContract {
-		contractIDBytes := function.MustInvokeContract().ContractAddress.ContractId
-		var err error
-		contractID, err = strkey.Encode(strkey.VersionByteContract, contractIDBytes[:])
-		if err != nil {
-			return nil, fmt.Errorf("error encoding contract ID: %w", err)
-		}
-
-		// Extract function name from the function parameters
-		invokeContract := function.MustInvokeContract()
-
-		// The function name is typically the first argument in Soroban contract calls
-		if len(invokeContract.Args) > 0 {
-			// Try to get the function name from the first argument if it's a symbol
-			if sym, ok := invokeContract.Args[0].GetSym(); ok {
-				functionName = string(sym)
-				log.Printf("Found function name from first argument: %s", functionName)
-			} else {
-				// If the first argument isn't a symbol, try to inspect it more deeply
-				// Log the type for debugging
-				log.Printf("First argument type: %v", invokeContract.Args[0].Type)
-
-				// Try to marshal the argument to see its structure
-				argBytes, _ := json.Marshal(invokeContract.Args[0])
-				log.Printf("First argument value: %s", string(argBytes))
-
-				// Try to extract function name from the function itself if available
-				if invokeContract.FunctionName != "" {
-					functionName = string(invokeContract.FunctionName)
-					log.Printf("Found function name from FunctionName field: %s", functionName)
-				}
-			}
-		}
-
-		// Extract function arguments
-		// Skip the first argument if it's the function name (symbol)
-		startIdx := 0
-		if len(invokeContract.Args) > 0 {
-			if _, ok := invokeContract.Args[0].GetSym(); ok {
-				startIdx = 1
-			}
-		}
-
-		// Extract remaining arguments
-		for i := startIdx; i < len(invokeContract.Args); i++ {
-			argBytes, err := json.Marshal(invokeContract.Args[i])
-			if err != nil {
-				log.Printf("Error marshaling argument %d: %v", i, err)
-				continue
-			}
-			arguments = append(arguments, argBytes)
-		}
-
-		log.Printf("Extracted %d arguments for function %s", len(arguments), functionName)
-	}
-
-	// Determine if invocation was successful
-	successful := false
-
-	// First check the transaction result code
-	if tx.Result.Result.Result.Code == xdr.TransactionResultCodeTxSuccess {
-		// If the transaction was successful, check the operation result
-		if tx.Result.Result.Result.Results != nil {
-			if results := *tx.Result.Result.Result.Results; len(results) > opIndex {
-				if result := results[opIndex]; result.Code == xdr.OperationResultCodeOpInner {
-					if result.Tr != nil {
-						if invokeResult, ok := result.Tr.GetInvokeHostFunctionResult(); ok {
-							successful = invokeResult.Code == xdr.InvokeHostFunctionResultCodeInvokeHostFunctionSuccess
-						}
-					}
-				}
-			}
-		}
-	}
-
-	// Add debug logging
-	log.Printf("Transaction result code: %v", tx.Result.Result.Result.Code)
-
-	// Also check for diagnostic events - their presence often indicates success
-	if tx.UnsafeMeta.V == 3 {
-		sorobanMeta := tx.UnsafeMeta.V3.SorobanMeta
-		if sorobanMeta != nil && len(sorobanMeta.Events) > 0 {
-			// If there are diagnostic events, it's likely the invocation was successful
-			log.Printf("Found %d diagnostic events, which suggests successful execution", len(sorobanMeta.Events))
-			// We'll still use the result code as the primary indicator, but this is useful for debugging
-		}
-	}
-
-	log.Printf("Final success determination for %s: %v", functionName, successful)
-
-	p.mu.Lock()
-	p.stats.InvocationsFound++
-	if successful {
-		p.stats.SuccessfulInvokes++
-	} else {
-		p.stats.FailedInvokes++
-	}
-	p.mu.Unlock()
-
-	// Create invocation record
-	invocation := &ContractInvocation{
-		Timestamp:       time.Unix(int64(meta.LedgerHeaderHistoryEntry().Header.ScpValue.CloseTime), 0),
-		LedgerSequence:  meta.LedgerSequence(),
-		TransactionHash: tx.Result.TransactionHash.HexString(),
-		ContractID:      contractID,
-		InvokingAccount: invokingAccount.Address(),
-		Successful:      successful,
-		FunctionName:    functionName,
-		Arguments:       arguments,
-	}
-
-	// Extract diagnostic events
-	invocation.DiagnosticEvents = p.extractDiagnosticEvents(tx, opIndex)
-
-	// If function name is still empty, try to extract it from diagnostic events as a fallback
-	if invocation.FunctionName == "" && len(invocation.DiagnosticEvents) > 0 {
-		for _, event := range invocation.DiagnosticEvents {
-			if len(event.Topics) > 0 {
-				// Try to parse the first topic to see if it contains a function name
-				var topicData map[string]interface{}
-				if err := json.Unmarshal([]byte(event.Topics[0]), &topicData); err == nil {
-					if symValue, ok := topicData["Sym"].(string); ok && symValue != "" {
-						invocation.FunctionName = symValue
-						log.Printf("Extracted function name from diagnostic event: %s", invocation.FunctionName)
-						break
-					}
-				}
-			}
-		}
-	}
-
-	// Extract contract-to-contract calls
-	invocation.ContractCalls = p.extractContractCalls(tx, opIndex)
-
-	// Extract state changes
-	invocation.StateChanges = p.extractStateChanges(tx, opIndex)
-
-	// Extract TTL extensions
-	invocation.TtlExtensions = p.extractTtlExtensions(tx, opIndex)
-
-	// Extract temporary data
-	invocation.TemporaryData = p.extractTemporaryData(tx, opIndex, arguments)
-
-	return invocation, nil
-}
-
+// forwardToConsumers sends the invocation to all registered consumers
 func (p *ContractInvocationProcessor) forwardToConsumers(ctx context.Context, invocation *ContractInvocation) error {
+	// Check for context cancellation
+	if err := ctx.Err(); err != nil {
+		return NewProcessorError(
+			fmt.Errorf("context canceled before forwarding: %w", err),
+			ErrorTypeConsumer,
+			ErrorSeverityWarning,
+		)
+	}
+
+	// Serialize the invocation to JSON
 	jsonBytes, err := json.Marshal(invocation)
 	if err != nil {
-		return fmt.Errorf("error marshaling invocation: %w", err)
+		return NewProcessorError(
+			fmt.Errorf("error marshaling invocation: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		)
 	}
 
-	log.Printf("Forwarding invocation with function name: %s", invocation.FunctionName)
-	log.Printf("JSON payload: %s", string(jsonBytes))
+	// Create message for consumers
+	msg := pluginapi.Message{
+		Payload:   jsonBytes,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"ledger_sequence":  invocation.LedgerSequence,
+			"contract_id":      invocation.ContractID,
+			"function_name":    invocation.FunctionName,
+			"transaction_hash": invocation.TransactionHash,
+		},
+	}
 
-	log.Printf("Forwarding event to %d consumers", len(p.consumers))
-	for _, consumer := range p.consumers {
-		log.Printf("Forwarding to consumer: %s", consumer.Name())
-		if err := consumer.Process(ctx, pluginapi.Message{
-			Payload:   jsonBytes,
-			Timestamp: time.Now(),
-			Metadata: map[string]interface{}{
-				"ledger_sequence": invocation.LedgerSequence,
-				"contract_id":     invocation.ContractID,
-				"function_name":   invocation.FunctionName,
-			},
-		}); err != nil {
-			return fmt.Errorf("error in consumer chain: %w", err)
+	// Make a copy of consumers to avoid race conditions
+	p.mu.RLock()
+	consumers := make([]pluginapi.Consumer, len(p.consumers))
+	copy(consumers, p.consumers)
+	p.mu.RUnlock()
+
+	// Send to each consumer
+	for _, consumer := range consumers {
+		// Check context before each consumer to allow early exit
+		if err := ctx.Err(); err != nil {
+			return NewProcessorError(
+				fmt.Errorf("context canceled during forwarding: %w", err),
+				ErrorTypeConsumer,
+				ErrorSeverityWarning,
+			)
+		}
+
+		// Process with a timeout for each consumer
+		consumerCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := consumer.Process(consumerCtx, msg)
+		cancel() // Always cancel to prevent context leak
+
+		if err != nil {
+			return NewProcessorError(
+				fmt.Errorf("error in consumer %s: %w", consumer.Name(), err),
+				ErrorTypeConsumer,
+				ErrorSeverityWarning,
+			).WithContext("consumer", consumer.Name())
 		}
 	}
+
 	return nil
 }
 
@@ -713,4 +783,214 @@ func (p *ContractInvocationProcessor) extractTemporaryData(
 	}
 
 	return tempData
+}
+
+// GetStatus returns operational metrics for the processor
+func (p *ContractInvocationProcessor) GetStatus() map[string]interface{} {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	return map[string]interface{}{
+		"stats":     p.stats,
+		"uptime":    time.Since(p.stats.StartTime).String(),
+		"consumers": len(p.consumers),
+	}
+}
+
+// processContractInvocation extracts and processes a contract invocation
+func (p *ContractInvocationProcessor) processContractInvocation(
+	ctx context.Context,
+	tx ingest.LedgerTransaction,
+	opIndex int,
+	op xdr.Operation,
+	meta xdr.LedgerCloseMeta,
+) (*ContractInvocation, error) {
+	// Check for context cancellation
+	if err := ctx.Err(); err != nil {
+		return nil, NewProcessorError(
+			fmt.Errorf("context canceled during invocation processing: %w", err),
+			ErrorTypeProcessing,
+			ErrorSeverityWarning,
+		).WithContext("operation_index", opIndex)
+	}
+
+	// Use the correct method to access the invoke host function operation
+	invokeHostFunction := op.Body.InvokeHostFunctionOp
+
+	// Get the invoking account
+	var invokingAccount xdr.AccountId
+	if op.SourceAccount != nil {
+		invokingAccount = op.SourceAccount.ToAccountId()
+	} else {
+		invokingAccount = tx.Envelope.SourceAccount().ToAccountId()
+	}
+
+	invokingAccountAddress, err := invokingAccount.GetAddress()
+	if err != nil {
+		return nil, NewProcessorError(
+			fmt.Errorf("error getting invoking account address: %w", err),
+			ErrorTypeParsing,
+			ErrorSeverityWarning,
+		).WithContext("operation_index", opIndex)
+	}
+
+	// Get contract ID if available
+	var contractID string
+	var functionName string
+	var arguments []json.RawMessage
+
+	if function := invokeHostFunction.HostFunction; function.Type == xdr.HostFunctionTypeHostFunctionTypeInvokeContract {
+		contractIDBytes := function.MustInvokeContract().ContractAddress.ContractId
+		contractID, err = strkey.Encode(strkey.VersionByteContract, contractIDBytes[:])
+		if err != nil {
+			return nil, NewProcessorError(
+				fmt.Errorf("error encoding contract ID: %w", err),
+				ErrorTypeParsing,
+				ErrorSeverityWarning,
+			).WithContext("operation_index", opIndex)
+		}
+
+		// Extract function name from the function parameters
+		invokeContract := function.MustInvokeContract()
+
+		// The function name is typically the first argument in Soroban contract calls
+		if len(invokeContract.Args) > 0 {
+			// Try to get the function name from the first argument if it's a symbol
+			if sym, ok := invokeContract.Args[0].GetSym(); ok {
+				functionName = string(sym)
+			} else {
+				// If the first argument isn't a symbol, try to inspect it more deeply
+				// Log the type for debugging
+				log.Printf("First argument type: %v", invokeContract.Args[0].Type)
+
+				// Try to marshal the argument to see its structure
+				argBytes, _ := json.Marshal(invokeContract.Args[0])
+				log.Printf("First argument value: %s", string(argBytes))
+
+				// Try to extract function name from the function itself if available
+				if invokeContract.FunctionName != "" {
+					functionName = string(invokeContract.FunctionName)
+				}
+			}
+		}
+
+		// Extract function arguments
+		// Skip the first argument if it's the function name (symbol)
+		startIdx := 0
+		if len(invokeContract.Args) > 0 {
+			if _, ok := invokeContract.Args[0].GetSym(); ok {
+				startIdx = 1
+			}
+		}
+
+		// Process arguments
+		for i := startIdx; i < len(invokeContract.Args); i++ {
+			if arg, err := json.Marshal(invokeContract.Args[i]); err == nil {
+				arguments = append(arguments, arg)
+			}
+		}
+	}
+
+	// Check if the operation was successful
+	successful := tx.Result.Successful()
+
+	// Create the invocation event
+	invocation := &ContractInvocation{
+		Timestamp:        time.Now(), // Use current time, ideally would use ledger close time
+		LedgerSequence:   meta.LedgerSequence(),
+		TransactionHash:  tx.Result.TransactionHash.HexString(),
+		TransactionID:    int64(tx.Index),
+		ContractID:       contractID,
+		InvokingAccount:  invokingAccountAddress,
+		FunctionName:     functionName,
+		Arguments:        arguments,
+		Successful:       successful,
+		DiagnosticEvents: p.extractDiagnosticEvents(tx, opIndex),
+		ContractCalls:    p.extractContractCalls(tx, opIndex),
+		StateChanges:     p.extractStateChanges(tx, opIndex),
+		TtlExtensions:    p.extractTtlExtensions(tx, opIndex),
+		TemporaryData:    p.extractTemporaryData(tx, opIndex, arguments),
+		Tags:             make(map[string]string),
+	}
+
+	// Add searchable tags for filtering
+	invocation.Tags["contract_id"] = contractID
+	invocation.Tags["function_name"] = functionName
+	invocation.Tags["successful"] = fmt.Sprintf("%t", successful)
+	invocation.Tags["invoking_account"] = invokingAccountAddress
+
+	return invocation, nil
+}
+
+// GetSchemaDefinition implements the SchemaProvider interface
+func (p *ContractInvocationProcessor) GetSchemaDefinition() string {
+	return `
+type ContractInvocation {
+	timestamp: String!
+	ledgerSequence: Int!
+	transactionHash: String!
+	transactionId: Int!
+	contractId: String!
+	invokingAccount: String!
+	functionName: String!
+	successful: Boolean!
+	arguments: [JSON]
+	diagnosticEvents: [DiagnosticEvent]
+	contractCalls: [ContractCall]
+	stateChanges: [StateChange]
+	ttlExtensions: [TtlExtension]
+	temporaryData: [TemporaryData]
+	tags: JSON
+}
+
+type DiagnosticEvent {
+	contractId: String!
+	topics: [String]!
+	data: JSON
+}
+
+type ContractCall {
+	fromContract: String!
+	toContract: String!
+	function: String!
+	successful: Boolean!
+}
+
+type StateChange {
+	contractId: String!
+	key: String!
+	oldValue: JSON
+	newValue: JSON
+	operation: String!
+}
+
+type TtlExtension {
+	contractId: String!
+	oldTtl: Int!
+	newTtl: Int!
+}
+
+type TemporaryData {
+	type: String!
+	key: String!
+	value: JSON
+	expiresAt: String
+	ledgerEntry: JSON
+	contractId: String
+	relatedArgs: [Int]
+	argValues: [JSON]
+}
+
+scalar JSON
+`
+}
+
+// GetQueryDefinitions implements the SchemaProvider interface
+func (p *ContractInvocationProcessor) GetQueryDefinitions() string {
+	return `
+	getContractInvocationByHash(hash: String!): ContractInvocation
+	getContractInvocationsByContract(contractId: String!, limit: Int, offset: Int): [ContractInvocation]
+	getContractInvocationsByFunction(contractId: String!, functionName: String!, limit: Int, offset: Int): [ContractInvocation]
+	getContractInvocationsByAccount(account: String!, limit: Int, offset: Int): [ContractInvocation]
+`
 }

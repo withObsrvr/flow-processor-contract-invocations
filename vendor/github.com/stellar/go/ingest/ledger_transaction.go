@@ -14,7 +14,7 @@ import (
 
 // LedgerTransaction represents the data for a single transaction within a ledger.
 type LedgerTransaction struct {
-	Index    uint32 // this index is 1-indexed as opposed to zero. Refer Read() in ledger_transaction_reader.go
+	Index    uint32
 	Envelope xdr.TransactionEnvelope
 	Result   xdr.TransactionResultPair
 	// FeeChanges and UnsafeMeta are low level values, do not use them directly unless
@@ -30,10 +30,6 @@ type LedgerTransaction struct {
 
 func (t *LedgerTransaction) txInternalError() bool {
 	return t.Result.Result.Result.Code == xdr.TransactionResultCodeTxInternalError
-}
-
-func (t *LedgerTransaction) FeeAccount() xdr.MuxedAccount {
-	return t.Envelope.FeeAccount()
 }
 
 // GetFeeChanges returns a developer friendly representation of LedgerEntryChanges
@@ -594,6 +590,31 @@ func (t *LedgerTransaction) AccountMuxed() (string, bool) {
 
 	return sourceAccount.Address(), true
 
+}
+
+func (t *LedgerTransaction) FeeAccount() (string, bool) {
+	if !t.Envelope.IsFeeBump() {
+		return "", false
+	}
+
+	feeBumpAccount := t.Envelope.FeeBumpAccount()
+	feeAccount := feeBumpAccount.ToAccountId()
+
+	return feeAccount.Address(), true
+
+}
+
+func (t *LedgerTransaction) FeeAccountMuxed() (string, bool) {
+	if !t.Envelope.IsFeeBump() {
+		return "", false
+	}
+
+	feeBumpAccount := t.Envelope.FeeBumpAccount()
+	if feeBumpAccount.Type != xdr.CryptoKeyTypeKeyTypeMuxedEd25519 {
+		return "", false
+	}
+
+	return feeBumpAccount.Address(), true
 }
 
 func (t *LedgerTransaction) InnerTransactionHash() (string, bool) {

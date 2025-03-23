@@ -3,7 +3,7 @@ module github.com/withObsrvr/flow-processor-contract-invocations
 go 1.23.4
 
 require (
-	github.com/stellar/go v0.0.0-20250322075617-5ccaef04a539
+	github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4
 	github.com/withObsrvr/pluginapi v0.0.0-20250303141549-e645e333195c
 )
 

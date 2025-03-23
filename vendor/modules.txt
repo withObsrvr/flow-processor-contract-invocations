@@ -320,7 +320,7 @@ github.com/segmentio/go-loggly
 ## explicit; go 1.13
 github.com/sirupsen/logrus
 github.com/sirupsen/logrus/hooks/test
-# github.com/stellar/go v0.0.0-20250322075617-5ccaef04a539
+# github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4
 ## explicit; go 1.23
 github.com/stellar/go/clients/stellarcore
 github.com/stellar/go/hash

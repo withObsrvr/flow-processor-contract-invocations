@@ -2,7 +2,6 @@ package xdr
 
 import (
 	"fmt"
-	"time"
 )
 
 func (l LedgerCloseMeta) LedgerHeaderHistoryEntry() LedgerHeaderHistoryEntry {
@@ -22,10 +21,6 @@ func (l LedgerCloseMeta) LedgerSequence() uint32 {
 
 func (l LedgerCloseMeta) LedgerCloseTime() int64 {
 	return int64(l.LedgerHeaderHistoryEntry().Header.ScpValue.CloseTime)
-}
-
-func (l LedgerCloseMeta) ClosedAt() time.Time {
-	return time.Unix(l.LedgerCloseTime(), 0).UTC()
 }
 
 func (l LedgerCloseMeta) LedgerHash() Hash {

@@ -8,9 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/stellar/go/ingest"
@@ -18,183 +16,6 @@ import (
 	"github.com/stellar/go/xdr"
 	"github.com/withObsrvr/pluginapi"
 )
-
-// ErrorType categorizes the type of error for better handling
-type ErrorType string
-
-const (
-	ErrorTypeConfig      ErrorType = "config"
-	ErrorTypeProcessing  ErrorType = "processing"
-	ErrorTypeParsing     ErrorType = "parsing"
-	ErrorTypeConsumer    ErrorType = "consumer"
-	ErrorTypeUnsupported ErrorType = "unsupported"
-)
-
-// ErrorSeverity indicates how serious an error is
-type ErrorSeverity string
-
-const (
-	ErrorSeverityFatal   ErrorSeverity = "fatal"
-	ErrorSeverityError   ErrorSeverity = "error"
-	ErrorSeverityWarning ErrorSeverity = "warning"
-)
-
-// ProcessorError implements a rich error type for better error handling
-type ProcessorError struct {
-	Err             error                  // Original error
-	Type            ErrorType              // Category of error
-	Severity        ErrorSeverity          // How serious the error is
-	TransactionHash string                 // Transaction context
-	LedgerSequence  uint32                 // Ledger context
-	ContractID      string                 // Contract context
-	Context         map[string]interface{} // Additional metadata
-}
-
-// NewProcessorError creates a new processor error with the given parameters
-func NewProcessorError(err error, errType ErrorType, severity ErrorSeverity) *ProcessorError {
-	return &ProcessorError{
-		Err:      err,
-		Type:     errType,
-		Severity: severity,
-		Context:  make(map[string]interface{}),
-	}
-}
-
-// Error implements the error interface
-func (e *ProcessorError) Error() string {
-	parts := []string{fmt.Sprintf("[%s:%s] %v", e.Type, e.Severity, e.Err)}
-
-	if e.LedgerSequence > 0 {
-		parts = append(parts, fmt.Sprintf("ledger=%d", e.LedgerSequence))
-	}
-
-	if e.TransactionHash != "" {
-		parts = append(parts, fmt.Sprintf("tx=%s", e.TransactionHash))
-	}
-
-	if e.ContractID != "" {
-		parts = append(parts, fmt.Sprintf("contract=%s", e.ContractID))
-	}
-
-	for k, v := range e.Context {
-		parts = append(parts, fmt.Sprintf("%s=%v", k, v))
-	}
-
-	return strings.Join(parts, " ")
-}
-
-// WithLedger adds ledger sequence context to the error
-func (e *ProcessorError) WithLedger(sequence uint32) *ProcessorError {
-	e.LedgerSequence = sequence
-	return e
-}
-
-// WithTransaction adds transaction hash context to the error
-func (e *ProcessorError) WithTransaction(hash string) *ProcessorError {
-	e.TransactionHash = hash
-	return e
-}
-
-// WithContract adds contract ID context to the error
-func (e *ProcessorError) WithContract(id string) *ProcessorError {
-	e.ContractID = id
-	return e
-}
-
-// WithContext adds additional context to the error
-func (e *ProcessorError) WithContext(key string, value interface{}) *ProcessorError {
-	e.Context[key] = value
-	return e
-}
-
-// ContractInvocation represents a contract invocation event
-type ContractInvocation struct {
-	// Transaction context
-	Timestamp       time.Time `json:"timestamp"`
-	LedgerSequence  uint32    `json:"ledger_sequence"`
-	TransactionHash string    `json:"transaction_hash"`
-	TransactionID   int64     `json:"transaction_id"`
-
-	// Invocation context
-	ContractID      string `json:"contract_id"`
-	InvokingAccount string `json:"invoking_account"`
-	FunctionName    string `json:"function_name"`
-	Successful      bool   `json:"successful"`
-
-	// Invocation details
-	Arguments        []json.RawMessage `json:"arguments,omitempty"`
-	DiagnosticEvents []DiagnosticEvent `json:"diagnostic_events,omitempty"`
-	ContractCalls    []ContractCall    `json:"contract_calls,omitempty"`
-	StateChanges     []StateChange     `json:"state_changes,omitempty"`
-	TtlExtensions    []TtlExtension    `json:"ttl_extensions,omitempty"`
-	TemporaryData    []TemporaryData   `json:"temporary_data,omitempty"`
-
-	// Searchable tags for filtering
-	Tags map[string]string `json:"tags,omitempty"`
-}
-
-// DiagnosticEvent represents a diagnostic event emitted during contract execution
-type DiagnosticEvent struct {
-	ContractID string          `json:"contract_id"`
-	Topics     []string        `json:"topics"`
-	Data       json.RawMessage `json:"data"`
-}
-
-// ContractCall represents a contract-to-contract call
-type ContractCall struct {
-	FromContract string `json:"from_contract"`
-	ToContract   string `json:"to_contract"`
-	Function     string `json:"function"`
-	Successful   bool   `json:"successful"`
-}
-
-// StateChange represents a contract state change
-type StateChange struct {
-	ContractID string          `json:"contract_id"`
-	Key        string          `json:"key"`
-	OldValue   json.RawMessage `json:"old_value,omitempty"`
-	NewValue   json.RawMessage `json:"new_value,omitempty"`
-	Operation  string          `json:"operation"` // "create", "update", "delete"
-}
-
-// TtlExtension represents a TTL extension for a contract
-type TtlExtension struct {
-	ContractID string `json:"contract_id"`
-	OldTtl     uint32 `json:"old_ttl"`
-	NewTtl     uint32 `json:"new_ttl"`
-}
-
-// TemporaryData represents temporary data created during contract execution
-type TemporaryData struct {
-	Type        string          `json:"type"`
-	Key         string          `json:"key"`
-	Value       json.RawMessage `json:"value"`
-	ExpiresAt   uint64          `json:"expires_at,omitempty"`
-	LedgerEntry json.RawMessage `json:"ledger_entry,omitempty"`
-	ContractID  string          `json:"contract_id,omitempty"`
-	// Add fields to track which arguments were used
-	RelatedArgs []int             `json:"related_args,omitempty"` // Indices of arguments that relate to this data
-	ArgValues   []json.RawMessage `json:"arg_values,omitempty"`   // Values of related arguments
-}
-
-// ProcessorStats contains operational metrics for the processor
-type ProcessorStats struct {
-	ProcessedLedgers  uint32    `json:"processed_ledgers"`
-	InvocationsFound  uint64    `json:"invocations_found"`
-	SuccessfulInvokes uint64    `json:"successful_invokes"`
-	FailedInvokes     uint64    `json:"failed_invokes"`
-	LastLedger        uint32    `json:"last_ledger"`
-	LastProcessedTime time.Time `json:"last_processed_time"`
-	StartTime         time.Time `json:"start_time"`
-}
-
-// ContractInvocationProcessor implements the pluginapi.Processor and pluginapi.Consumer interfaces
-type ContractInvocationProcessor struct {
-	consumers         []pluginapi.Consumer
-	networkPassphrase string
-	mu                sync.RWMutex
-	stats             ProcessorStats
-}
 
 // New creates a new instance of the plugin
 func New() pluginapi.Plugin {
@@ -254,51 +75,6 @@ func (p *ContractInvocationProcessor) Initialize(config map[string]interface{}) 
 	p.networkPassphrase = networkPassphrase
 	log.Printf("Initialized ContractInvocationProcessor with network: %s", networkPassphrase)
 	return nil
-}
-
-// isCompatibleVersion checks if the current version is compatible with the minimum required version
-// This is a simplified version compare - in production, use a proper semver library
-func isCompatibleVersion(current, minimum string) bool {
-	// Parse versions - this is a simple implementation
-	// In production code, use a proper semver library
-	currentParts := strings.Split(current, ".")
-	minimumParts := strings.Split(minimum, ".")
-
-	// Ensure we have at least 3 parts (major.minor.patch)
-	for len(currentParts) < 3 {
-		currentParts = append(currentParts, "0")
-	}
-	for len(minimumParts) < 3 {
-		minimumParts = append(minimumParts, "0")
-	}
-
-	// Compare major version
-	currentMajor, _ := strconv.Atoi(currentParts[0])
-	minimumMajor, _ := strconv.Atoi(minimumParts[0])
-
-	if currentMajor > minimumMajor {
-		return true
-	}
-	if currentMajor < minimumMajor {
-		return false
-	}
-
-	// Compare minor version
-	currentMinor, _ := strconv.Atoi(currentParts[1])
-	minimumMinor, _ := strconv.Atoi(minimumParts[1])
-
-	if currentMinor > minimumMinor {
-		return true
-	}
-	if currentMinor < minimumMinor {
-		return false
-	}
-
-	// Compare patch version
-	currentPatch, _ := strconv.Atoi(currentParts[2])
-	minimumPatch, _ := strconv.Atoi(minimumParts[2])
-
-	return currentPatch >= minimumPatch
 }
 
 // RegisterConsumer implements the ConsumerRegistry interface
@@ -1466,21 +1242,6 @@ func (p *ContractInvocationProcessor) GetQueryDefinitions() string {
 }
 
 // Add these structures after the existing ContractInvocation struct
-
-// DualValue represents both raw and decoded versions of a value
-type DualValue struct {
-	Raw     string          `json:"raw"`     // Raw encoded data
-	Decoded json.RawMessage `json:"decoded"` // Decoded human-readable data
-}
-
-// ScValDualRepresentation stores both raw and decoded versions of a Stellar ScVal
-type ScValDualRepresentation struct {
-	Type      string          `json:"type"`
-	RawValue  string          `json:"raw_value"`
-	Value     json.RawMessage `json:"value"`
-	TypeInt   int32           `json:"type_int,omitempty"`
-	ScValType string          `json:"scval_type,omitempty"`
-}
 
 // serializeScVal converts a Stellar ScVal to its dual representation (raw and decoded)
 func serializeScVal(scVal xdr.ScVal) *ScValDualRepresentation {

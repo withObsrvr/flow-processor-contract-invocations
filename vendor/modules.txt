@@ -141,6 +141,9 @@ github.com/cncf/xds/go/xds/type/v3
 # github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc
 ## explicit
 github.com/davecgh/go-spew/spew
+# github.com/dgryski/go-farm v0.0.0-20240924180020-3414d57e47da
+## explicit
+github.com/dgryski/go-farm
 # github.com/djherbis/fscache v0.10.1
 ## explicit
 github.com/djherbis/fscache
@@ -190,6 +193,9 @@ github.com/envoyproxy/protoc-gen-validate/validate
 # github.com/felixge/httpsnoop v1.0.4
 ## explicit; go 1.13
 github.com/felixge/httpsnoop
+# github.com/go-chi/chi v4.1.2+incompatible
+## explicit
+github.com/go-chi/chi
 # github.com/go-errors/errors v1.5.1
 ## explicit; go 1.14
 github.com/go-errors/errors
@@ -244,10 +250,20 @@ github.com/googleapis/gax-go/v2/internallog
 github.com/googleapis/gax-go/v2/internallog/grpclog
 github.com/googleapis/gax-go/v2/internallog/internal
 github.com/googleapis/gax-go/v2/iterator
+# github.com/gorilla/schema v1.4.1
+## explicit; go 1.20
+github.com/gorilla/schema
+# github.com/guregu/null v4.0.0+incompatible
+## explicit
+github.com/guregu/null
+github.com/guregu/null/zero
 # github.com/hashicorp/golang-lru v1.0.2
 ## explicit; go 1.12
 github.com/hashicorp/golang-lru
 github.com/hashicorp/golang-lru/simplelru
+# github.com/holiman/uint256 v1.2.3
+## explicit; go 1.18
+github.com/holiman/uint256
 # github.com/jmespath/go-jmespath v0.4.0
 ## explicit; go 1.14
 github.com/jmespath/go-jmespath
@@ -320,34 +336,53 @@ github.com/segmentio/go-loggly
 ## explicit; go 1.13
 github.com/sirupsen/logrus
 github.com/sirupsen/logrus/hooks/test
+# github.com/spf13/pflag v1.0.5
+## explicit; go 1.12
+github.com/spf13/pflag
 # github.com/stellar/go v0.0.0-20250311234916-385ac5aca1a4
 ## explicit; go 1.23
+github.com/stellar/go/amount
 github.com/stellar/go/clients/stellarcore
+github.com/stellar/go/exp/orderbook
 github.com/stellar/go/hash
 github.com/stellar/go/historyarchive
 github.com/stellar/go/ingest
 github.com/stellar/go/ingest/ledgerbackend
 github.com/stellar/go/keypair
 github.com/stellar/go/network
+github.com/stellar/go/price
+github.com/stellar/go/protocols/horizon
+github.com/stellar/go/protocols/horizon/base
 github.com/stellar/go/protocols/stellarcore
 github.com/stellar/go/strkey
 github.com/stellar/go/strkey/internal/crc16
 github.com/stellar/go/support/collections/heap
 github.com/stellar/go/support/collections/set
 github.com/stellar/go/support/compressxdr
+github.com/stellar/go/support/contractevents
 github.com/stellar/go/support/datastore
 github.com/stellar/go/support/db
 github.com/stellar/go/support/db/sqlutils
 github.com/stellar/go/support/errors
+github.com/stellar/go/support/http/httpdecode
 github.com/stellar/go/support/log
 github.com/stellar/go/support/ordered
+github.com/stellar/go/support/render/hal
+github.com/stellar/go/support/render/httpjson
+github.com/stellar/go/support/render/problem
 github.com/stellar/go/support/storage
 github.com/stellar/go/support/url
 github.com/stellar/go/toid
+github.com/stellar/go/txnbuild
 github.com/stellar/go/xdr
 # github.com/stellar/go-xdr v0.0.0-20231122183749-b53fb00bcac2
 ## explicit; go 1.12
 github.com/stellar/go-xdr/xdr3
+# github.com/stellar/stellar-etl v1.0.0
+## explicit; go 1.19
+github.com/stellar/stellar-etl/internal/toid
+github.com/stellar/stellar-etl/internal/transform
+github.com/stellar/stellar-etl/internal/utils
 # github.com/stretchr/objx v0.5.2
 ## explicit; go 1.20
 github.com/stretchr/objx

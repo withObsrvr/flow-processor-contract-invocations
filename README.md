@@ -1,136 +1,68 @@
-# Flow Plugin: Contract Invocations Processor
+# Flow Processor: Soroban Contract Invocations
 
-This Flow processor plugin extracts and processes contract invocations from the Stellar/Soroban blockchain. It identifies contract invocation operations, extracts metadata, and forwards the processed invocations to registered consumers.
+This processor extracts and processes Soroban smart contract invocations from the Stellar blockchain, providing detailed information about contract interactions.
 
 ## Features
 
-- Extracts contract invocations from Soroban blockchain data
-- Processes contract function calls with arguments
-- Tracks diagnostic events, contract-to-contract calls, state changes, and TTL extensions
-- Implements rich error handling with detailed context
-- Provides operational metrics and health status
-- Implements GraphQL schema for data API integration
-- Uses thread-safe operations for concurrent processing
+- **Contract Invocation Detection**: Identifies and extracts contract invocation operations
+- **Contract-to-Contract Call Tracking**: Traces calls between different contracts
+- **State Change Monitoring**: Records contract state changes with before and after values
+- **TTL Extension Tracking**: Captures TTL extensions for contract data
+- **Argument Extraction**: Parses and formats function arguments
+- **Temporary Data Tracking**: Records temporary data created during contract execution
+- **Diagnostic Event Logging**: Captures contract diagnostic events
+
+## Installation
+
+Build the processor as a plugin:
+
+```bash
+make build
+```
+
+This will create a `contract-invocations.so` file that can be loaded by the Flow engine.
 
 ## Configuration
 
-```json
-{
-  "network_passphrase": "Public Global Stellar Network ; September 2015",
-  "flow_api_version": "1.0.0"
-}
+In your Flow configuration, add the following:
+
+```yaml
+processors:
+  - name: contract-invocations
+    path: /path/to/contract-invocations.so
+    config:
+      network_passphrase: "Public Global Stellar Network ; September 2015"
+      # Optional configuration parameters
+      flow_api_version: "1.0.0"
 ```
 
-| Parameter | Required | Type | Default | Description |
-|-----------|----------|------|---------|-------------|
-| network_passphrase | Yes | string | - | The network passphrase for the Stellar network to process |
-| flow_api_version | No | string | - | The Flow API version for compatibility checks |
+## Output
 
-## Input & Output Schema
-
-### Input
-
-The plugin expects input messages with:
-- Payload type: `xdr.LedgerCloseMeta` from the Stellar XDR types
-- Expected format: Ledger close metadata containing transactions with contract invocations
-
-### Output
-
-The plugin produces messages with:
-- Payload type: JSON-serialized `ContractInvocation` struct
-- Metadata: Contains ledger sequence, contract ID, function name, transaction hash
-- Format: Structured contract invocation data with function arguments and execution context
-
-Example:
-```json
-{
-  "timestamp": "2023-05-16T09:28:15Z",
-  "ledger_sequence": 123456,
-  "transaction_hash": "abcdef1234567890",
-  "transaction_id": 42,
-  "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-  "invoking_account": "GDNHSWTGFOZQDEHQFQH23KIZJXSUDNF76QR674WXCXIE4HW5RUD5FYN5",
-  "function_name": "increment",
-  "successful": true,
-  "arguments": [
-    {"type":"uint32","value":"5"}
-  ],
-  "tags": {
-    "contract_id": "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4",
-    "function_name": "increment",
-    "successful": "true",
-    "invoking_account": "GDNHSWTGFOZQDEHQFQH23KIZJXSUDNF76QR674WXCXIE4HW5RUD5FYN5"
-  }
-}
-```
-
-## GraphQL Schema
-
-The plugin contributes the following GraphQL schema:
-
-### Types
+The processor outputs data with the following schema:
 
 ```graphql
 type ContractInvocation {
-    timestamp: String!
-    ledgerSequence: Int!
-    transactionHash: String!
-    transactionId: Int!
-    contractId: String!
-    invokingAccount: String!
-    functionName: String!
-    successful: Boolean!
-    arguments: [JSON]
-    diagnosticEvents: [DiagnosticEvent]
-    contractCalls: [ContractCall]
-    stateChanges: [StateChange]
-    ttlExtensions: [TtlExtension]
-    temporaryData: [TemporaryData]
-    tags: JSON
+  timestamp: String!
+  ledgerSequence: Int!
+  transactionHash: String!
+  transactionId: Int!
+  contractId: String!
+  invokingAccount: String!
+  functionName: String!
+  successful: Boolean!
+  arguments: [JSON]
+  diagnosticEvents: [DiagnosticEvent]
+  contractCalls: [ContractCall]
+  stateChanges: [StateChange]
+  ttlExtensions: [TtlExtension]
+  temporaryData: [TemporaryData]
+  tags: JSON
 }
-
-type DiagnosticEvent {
-    contractId: String!
-    topics: [String]!
-    data: JSON
-}
-
-type ContractCall {
-    fromContract: String!
-    toContract: String!
-    function: String!
-    successful: Boolean!
-}
-
-type StateChange {
-    contractId: String!
-    key: String!
-    oldValue: JSON
-    newValue: JSON
-    operation: String!
-}
-
-type TtlExtension {
-    contractId: String!
-    oldTtl: Int!
-    newTtl: Int!
-}
-
-type TemporaryData {
-    type: String!
-    key: String!
-    value: JSON
-    expiresAt: String
-    ledgerEntry: JSON
-    contractId: String
-    relatedArgs: [Int]
-    argValues: [JSON]
-}
-
-scalar JSON
 ```
 
-### Queries
+## Queries
+
+The processor supports the following GraphQL queries:
 
 ```graphql
 getContractInvocationByHash(hash: String!): ContractInvocation
@@ -139,39 +71,40 @@ getContractInvocationsByFunction(contractId: String!, functionName: String!, lim
 getContractInvocationsByAccount(account: String!, limit: Int, offset: Int): [ContractInvocation]
 ```
 
-## Metrics & Monitoring
-
-The plugin exposes these operational metrics:
-
-| Metric | Type | Description |
-|--------|------|-------------|
-| processed_ledgers | Counter | Total number of ledgers processed |
-| invocations_found | Counter | Total number of contract invocations found |
-| successful_invokes | Counter | Total number of successful invocations |
-| failed_invokes | Counter | Total number of failed invocations |
-| last_ledger | Gauge | Sequence number of the last processed ledger |
-| last_processed_time | Timestamp | When the last ledger was processed |
-| uptime | Duration | How long the processor has been running |
-
 ## Development
 
-### Prerequisites
+### Requirements
 
-- Go 1.23.4 or compatible
-- Nix (optional, for reproducible builds)
+- Go 1.19 or later
+- Access to a Stellar Horizon instance
 
 ### Building
 
 ```bash
-# With Go
-go build -buildmode=plugin -o flow-processor-contract-invocations.so .
-
-# With Nix
-nix build
+make build      # Build the plugin
+make clean      # Clean build artifacts
+make test       # Run tests
+make lint       # Run linters
+make dev        # Clean and rebuild
 ```
 
-The plugin will be built as a shared object file that can be loaded by the Flow runtime.
+### Code Structure
+
+- `processor.go`: Main processor implementation
+- `schema.go`: GraphQL schema definitions
+- `types.go`: Type definitions
+- `errors.go`: Error handling
+- `utility.go`: Utility functions
+- `extractors/`: Directory containing extraction logic
+  - `contract_calls.go`: Contract call extraction
+  - `state_changes.go`: State change extraction
+  - `ttl_extensions.go`: TTL extension extraction
+  - `arguments.go`: Argument extraction
+  - `temporary_data.go`: Temporary data extraction
+  - `diagnostic_events.go`: Diagnostic event extraction
 
 ## License
 
-This project is licensed under the terms specified in the repository.
+Copyright © 2023 Obsrvr, Inc.
+
+Licensed under the Apache License, Version 2.0

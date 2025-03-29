@@ -16,6 +16,7 @@
 
 # Dependency directories (remove the comment below to include it)
 #vendor/
+flow-processor-contract-events.md
 
 # Go workspace file
 go.work

@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -232,12 +234,71 @@ func (p *ContractInvocationProcessor) Initialize(config map[string]interface{}) 
 	// Check for API version compatibility
 	if apiVersion, ok := config["flow_api_version"].(string); ok {
 		log.Printf("Flow API Version: %s", apiVersion)
-		// Could implement version compatibility check here
+
+		// Define the minimum supported version
+		minSupportedVersion := "1.0.0"
+
+		// Simple semver comparison
+		if !isCompatibleVersion(apiVersion, minSupportedVersion) {
+			return NewProcessorError(
+				fmt.Errorf("flow_api_version %s is not compatible with minimum supported version %s",
+					apiVersion, minSupportedVersion),
+				ErrorTypeConfig,
+				ErrorSeverityFatal,
+			)
+		}
+
+		log.Printf("API version %s is compatible with minimum version %s", apiVersion, minSupportedVersion)
 	}
 
 	p.networkPassphrase = networkPassphrase
 	log.Printf("Initialized ContractInvocationProcessor with network: %s", networkPassphrase)
 	return nil
+}
+
+// isCompatibleVersion checks if the current version is compatible with the minimum required version
+// This is a simplified version compare - in production, use a proper semver library
+func isCompatibleVersion(current, minimum string) bool {
+	// Parse versions - this is a simple implementation
+	// In production code, use a proper semver library
+	currentParts := strings.Split(current, ".")
+	minimumParts := strings.Split(minimum, ".")
+
+	// Ensure we have at least 3 parts (major.minor.patch)
+	for len(currentParts) < 3 {
+		currentParts = append(currentParts, "0")
+	}
+	for len(minimumParts) < 3 {
+		minimumParts = append(minimumParts, "0")
+	}
+
+	// Compare major version
+	currentMajor, _ := strconv.Atoi(currentParts[0])
+	minimumMajor, _ := strconv.Atoi(minimumParts[0])
+
+	if currentMajor > minimumMajor {
+		return true
+	}
+	if currentMajor < minimumMajor {
+		return false
+	}
+
+	// Compare minor version
+	currentMinor, _ := strconv.Atoi(currentParts[1])
+	minimumMinor, _ := strconv.Atoi(minimumParts[1])
+
+	if currentMinor > minimumMinor {
+		return true
+	}
+	if currentMinor < minimumMinor {
+		return false
+	}
+
+	// Compare patch version
+	currentPatch, _ := strconv.Atoi(currentParts[2])
+	minimumPatch, _ := strconv.Atoi(minimumParts[2])
+
+	return currentPatch >= minimumPatch
 }
 
 // RegisterConsumer implements the ConsumerRegistry interface
@@ -429,7 +490,7 @@ func (p *ContractInvocationProcessor) forwardToConsumers(ctx context.Context, in
 				fmt.Errorf("context canceled during forwarding: %w", err),
 				ErrorTypeConsumer,
 				ErrorSeverityWarning,
-			)
+			).WithContext("consumer", consumer.Name())
 		}
 
 		// Process with a timeout for each consumer
@@ -510,19 +571,157 @@ func (p *ContractInvocationProcessor) extractContractCalls(tx ingest.LedgerTrans
 	// Check if we have Soroban meta in the transaction
 	if tx.UnsafeMeta.V == 3 {
 		sorobanMeta := tx.UnsafeMeta.V3.SorobanMeta
-		if sorobanMeta != nil {
-			// Process diagnostic events which may contain contract calls
-			if len(sorobanMeta.DiagnosticEvents) > 0 {
-				// Log diagnostic events for debugging
-				log.Printf("Found %d diagnostic events", len(sorobanMeta.DiagnosticEvents))
+		if sorobanMeta != nil && sorobanMeta.Events != nil {
+			for _, event := range sorobanMeta.Events {
+				// Look for contract-to-contract calls in the events
+				if event.Type == xdr.ContractEventTypeContract && event.Body.V0 != nil {
+					topics := event.Body.V0.Topics
 
-				// Future implementation will process these events
-				// when the XDR structure is better understood
+					// Skip if there aren't enough topics for a contract call (need at least 3)
+					// First topic is usually the function name, second and third can be contract addresses
+					if len(topics) < 3 {
+						continue
+					}
+
+					// Get function name from first topic (if it's a symbol)
+					var functionName string
+					if sym, ok := topics[0].GetSym(); ok {
+						functionName = string(sym)
+					} else {
+						continue // Skip if first topic is not a symbol
+					}
+
+					// Check if this is a contract call related function
+					if !isContractCallFunction(functionName) {
+						continue
+					}
+
+					// Extract "from" contract address (caller) from second topic
+					var fromContractID string
+					// Handle second topic as potential address
+					if address, err := extractAddressFromScVal(topics[1]); err == nil && address != "" {
+						fromContractID = address
+					} else {
+						continue // Skip if we can't get a valid from address
+					}
+
+					// Extract "to" contract address (callee) from third topic
+					var toContractID string
+					// Handle third topic as potential address
+					if address, err := extractAddressFromScVal(topics[2]); err == nil && address != "" {
+						toContractID = address
+					} else {
+						continue // Skip if we can't get a valid to address
+					}
+
+					// If both contract IDs are valid and different, record the call
+					if fromContractID != "" && toContractID != "" && fromContractID != toContractID {
+						// Build arguments from the remaining topics
+						var args []string
+						for i := 3; i < len(topics); i++ {
+							argBytes, err := json.Marshal(topics[i])
+							if err != nil {
+								log.Printf("Error marshaling argument topic: %v", err)
+								continue
+							}
+							args = append(args, string(argBytes))
+						}
+
+						// Add data if present
+						if event.Body.V0.Data != (xdr.ScVal{}) {
+							dataBytes, err := json.Marshal(event.Body.V0.Data)
+							if err == nil {
+								args = append(args, string(dataBytes))
+							}
+						}
+
+						// Create and add the contract call
+						contractCall := ContractCall{
+							FromContract: fromContractID,
+							ToContract:   toContractID,
+							Function:     functionName,
+							Successful:   true, // Default to true, to be updated based on diagnostics
+						}
+
+						calls = append(calls, contractCall)
+						log.Printf("Found contract call from %s to %s, function: %s", fromContractID, toContractID, functionName)
+					}
+				}
 			}
+		}
+
+		// Process diagnostic events if available
+		if sorobanMeta != nil && sorobanMeta.DiagnosticEvents != nil {
+			// Just log that we found diagnostic events, no need to process each one individually yet
+			log.Printf("Found %d diagnostic events for potential contract calls", len(sorobanMeta.DiagnosticEvents))
 		}
 	}
 
 	return calls
+}
+
+// extractAddressFromScVal attempts to extract a contract or account address from an ScVal
+func extractAddressFromScVal(val xdr.ScVal) (string, error) {
+	// Check for Address type
+	if val.Type == xdr.ScValTypeScvAddress {
+		address, ok := val.GetAddress()
+		if !ok {
+			return "", fmt.Errorf("failed to get address from ScVal")
+		}
+
+		switch address.Type {
+		case xdr.ScAddressTypeScAddressTypeContract:
+			if address.ContractId != nil {
+				return strkey.Encode(strkey.VersionByteContract, address.ContractId[:])
+			}
+		case xdr.ScAddressTypeScAddressTypeAccount:
+			if address.AccountId != nil {
+				if addr, err := address.AccountId.GetAddress(); err == nil {
+					return addr, nil
+				}
+			}
+		}
+	}
+
+	// Check for Bytes type (which might contain an address)
+	if val.Type == xdr.ScValTypeScvBytes {
+		if bytes, ok := val.GetBytes(); ok && len(bytes) == 32 {
+			// Might be a contract ID in bytes form
+			return strkey.Encode(strkey.VersionByteContract, bytes)
+		}
+	}
+
+	return "", fmt.Errorf("value does not contain a valid address")
+}
+
+// isContractCallFunction checks if a function name indicates a contract-to-contract call
+func isContractCallFunction(functionName string) bool {
+	// Common function names that might indicate contract calls
+	contractCallFunctions := map[string]bool{
+		"invoke":          true,
+		"call":            true,
+		"invoke_contract": true,
+		"cross_contract":  true,
+		"xchain":          true,
+		"transfer":        true,
+		"send":            true,
+		"execute":         true,
+	}
+
+	// Check if the function name is in our list
+	if contractCallFunctions[functionName] {
+		return true
+	}
+
+	// Check for common prefixes or suffixes
+	if strings.HasPrefix(functionName, "call_") ||
+		strings.HasPrefix(functionName, "invoke_") ||
+		strings.HasSuffix(functionName, "_call") ||
+		strings.HasSuffix(functionName, "_invoke") {
+		return true
+	}
+
+	return false
 }
 
 // processInvocation processes a contract invocation and extracts contract calls
@@ -577,17 +776,167 @@ func (p *ContractInvocationProcessor) extractStateChanges(tx ingest.LedgerTransa
 
 	// Check if we have Soroban meta in the transaction
 	if tx.UnsafeMeta.V == 3 {
-		sorobanMeta := tx.UnsafeMeta.V3.SorobanMeta
-		if sorobanMeta != nil {
-			// Based on the debug output, there's no direct state changes field
-			// State changes would need to be extracted from other transaction data
+		// Track contract data changes in Operations/Changes
+		for _, op := range tx.UnsafeMeta.V3.Operations {
+			if op.Changes != nil {
+				for _, change := range op.Changes {
+					// Process created contract data (state create)
+					if created, ok := change.GetCreated(); ok {
+						if created.Data.Type == xdr.LedgerEntryTypeContractData {
+							contractData := created.Data.ContractData
 
-			// Process events which may contain state change information
-			if len(sorobanMeta.Events) > 0 {
-				for _, _event := range sorobanMeta.Events {
-					// Process events for state changes
-					// Implementation depends on the structure of ContractEvent
-					_ = _event // Placeholder until implementation is complete
+							// Process the contract data creation
+							if contractData.Contract.Type == xdr.ScAddressTypeScAddressTypeContract && contractData.Contract.ContractId != nil {
+								// Get contract ID
+								contractID, err := strkey.Encode(strkey.VersionByteContract, contractData.Contract.ContractId[:])
+								if err != nil {
+									log.Printf("Error encoding contract ID: %v", err)
+									continue
+								}
+
+								// Get key and new value
+								keyBytes, err := json.Marshal(contractData.Key)
+								if err != nil {
+									log.Printf("Error marshaling key: %v", err)
+									continue
+								}
+
+								valueBytes, err := json.Marshal(contractData.Val)
+								if err != nil {
+									log.Printf("Error marshaling value: %v", err)
+									continue
+								}
+
+								// Create state change
+								stateChange := StateChange{
+									ContractID: contractID,
+									Key:        string(keyBytes),
+									NewValue:   valueBytes,
+									Operation:  "create",
+								}
+
+								changes = append(changes, stateChange)
+								log.Printf("Found state CREATION for contract %s, key: %s", contractID, string(keyBytes))
+							}
+						}
+					}
+
+					// Process updated contract data (state update)
+					if updated, ok := change.GetUpdated(); ok {
+						if updated.Data.Type == xdr.LedgerEntryTypeContractData {
+							contractData := updated.Data.ContractData
+
+							// Process the contract data update
+							if contractData.Contract.Type == xdr.ScAddressTypeScAddressTypeContract && contractData.Contract.ContractId != nil {
+								// Get contract ID
+								contractID, err := strkey.Encode(strkey.VersionByteContract, contractData.Contract.ContractId[:])
+								if err != nil {
+									log.Printf("Error encoding contract ID: %v", err)
+									continue
+								}
+
+								// Get key and new value
+								keyBytes, err := json.Marshal(contractData.Key)
+								if err != nil {
+									log.Printf("Error marshaling key: %v", err)
+									continue
+								}
+
+								valueBytes, err := json.Marshal(contractData.Val)
+								if err != nil {
+									log.Printf("Error marshaling value: %v", err)
+									continue
+								}
+
+								// Create state change
+								stateChange := StateChange{
+									ContractID: contractID,
+									Key:        string(keyBytes),
+									NewValue:   valueBytes,
+									Operation:  "update",
+								}
+
+								// Try to find the previous value if we can
+								// Note: In a complete implementation, we would track the old value by matching
+								// this contract and key in a previous entry in TxChangesBefore
+
+								changes = append(changes, stateChange)
+								log.Printf("Found state UPDATE for contract %s, key: %s", contractID, string(keyBytes))
+							}
+						}
+					}
+
+					// Process removed contract data (state delete)
+					if removed, ok := change.GetRemoved(); ok {
+						if removed.Type == xdr.LedgerEntryTypeContractData {
+							contractData := removed.ContractData
+
+							// Process the contract data removal
+							if contractData.Contract.Type == xdr.ScAddressTypeScAddressTypeContract && contractData.Contract.ContractId != nil {
+								// Get contract ID
+								contractID, err := strkey.Encode(strkey.VersionByteContract, contractData.Contract.ContractId[:])
+								if err != nil {
+									log.Printf("Error encoding contract ID: %v", err)
+									continue
+								}
+
+								// Get key
+								keyBytes, err := json.Marshal(contractData.Key)
+								if err != nil {
+									log.Printf("Error marshaling key: %v", err)
+									continue
+								}
+
+								// Create state change
+								stateChange := StateChange{
+									ContractID: contractID,
+									Key:        string(keyBytes),
+									Operation:  "delete",
+								}
+
+								// Try to find the old value if we can
+								// Note: In a complete implementation, we would track the old value by matching
+								// this contract and key in a previous entry in TxChangesBefore
+
+								changes = append(changes, stateChange)
+								log.Printf("Found state DELETION for contract %s, key: %s", contractID, string(keyBytes))
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Also check the Soroban-specific events for state changes
+		sorobanMeta := tx.UnsafeMeta.V3.SorobanMeta
+		if sorobanMeta != nil && sorobanMeta.Events != nil {
+			for _, event := range sorobanMeta.Events {
+				// Some contract events also indicate state changes through their topics and data
+				// This is more specialized and depends on the contract's conventions
+				if event.Type == xdr.ContractEventTypeContract && event.Body.V0 != nil {
+					topics := event.Body.V0.Topics
+
+					// Skip if there are no topics
+					if len(topics) < 1 {
+						continue
+					}
+
+					// Get event type from first topic
+					var eventType string
+					if sym, ok := topics[0].GetSym(); ok {
+						eventType = string(sym)
+					} else {
+						continue // Skip if first topic is not a symbol
+					}
+
+					// Look for events that indicate state changes like "set_value", "update", etc.
+					// These are contract-specific and would need to be customized
+					if eventType == "set" || eventType == "update" || eventType == "store" ||
+						eventType == "delete" || eventType == "remove" {
+						// These events likely indicate state changes
+						// Log for future implementation
+						log.Printf("Found potential state change event: %s", eventType)
+					}
 				}
 			}
 		}
@@ -602,15 +951,65 @@ func (p *ContractInvocationProcessor) extractTtlExtensions(tx ingest.LedgerTrans
 
 	// Check if we have Soroban meta in the transaction
 	if tx.UnsafeMeta.V == 3 {
+		// Check for TTL extensions in ledger entry changes
+		for _, op := range tx.UnsafeMeta.V3.Operations {
+			if op.Changes != nil {
+				for _, change := range op.Changes {
+					// Process updated contract data for TTL extensions
+					if updated, ok := change.GetUpdated(); ok {
+						if updated.Data.Type == xdr.LedgerEntryTypeContractData {
+							contractData := updated.Data.ContractData
+
+							// If this is a ContractData entry, check for TTL changes by comparing
+							// the LastModifiedLedgerSeq with the previous value
+							if contractData.Contract.Type == xdr.ScAddressTypeScAddressTypeContract &&
+								contractData.Contract.ContractId != nil {
+
+								// Get contract ID
+								contractID, err := strkey.Encode(strkey.VersionByteContract, contractData.Contract.ContractId[:])
+								if err != nil {
+									log.Printf("Error encoding contract ID: %v", err)
+									continue
+								}
+
+								// Check if the update includes TTL changes
+								// In a real implementation, we would compare with the previous entry
+								// For simplicity, we'll create TTL extension records when we detect
+								// updated contract data entries with a high LastModifiedLedgerSeq
+								newTtl := uint32(updated.LastModifiedLedgerSeq)
+								oldTtl := uint32(0) // Placeholder, in a real impl we'd find the old value
+
+								// Only record when new TTL > old TTL
+								if newTtl > oldTtl {
+									ttlExtension := TtlExtension{
+										ContractID: contractID,
+										OldTtl:     oldTtl,
+										NewTtl:     newTtl,
+									}
+									extensions = append(extensions, ttlExtension)
+									log.Printf("Found TTL extension for contract %s, new TTL: %d", contractID, newTtl)
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Check for explicit TTL extensions in the Soroban meta
+		// In Soroban, TTL extensions might be stored in specific fields
 		sorobanMeta := tx.UnsafeMeta.V3.SorobanMeta
 		if sorobanMeta != nil {
-			// Based on the debug output, SorobanTransactionMeta has:
-			// - Events
-			// - ReturnValue
-			// - DiagnosticEvents
-			// But no TTL extension information in this version
+			// For future TTL extension implementation:
+			// In future Soroban versions, TTL extensions might be available in:
+			// 1. SorobanTransactionMeta.FootprintChanges
+			// 2. SorobanTransactionMeta.ResourceChanges
+			// 3. SorobanTransactionMeta.ExtendFootprintTTL
 
-			// If TTL extensions are added in future versions, they would be processed here
+			// For now, log the presence of diagnostic events which might contain TTL info
+			if sorobanMeta.DiagnosticEvents != nil && len(sorobanMeta.DiagnosticEvents) > 0 {
+				log.Printf("Found diagnostic events that might contain TTL extension information")
+			}
 		}
 	}
 
@@ -621,19 +1020,100 @@ func (p *ContractInvocationProcessor) extractTtlExtensions(tx ingest.LedgerTrans
 func (p *ContractInvocationProcessor) extractArguments(tx ingest.LedgerTransaction, opIndex int) []json.RawMessage {
 	var arguments []json.RawMessage
 
-	// Check if we have Soroban meta in the transaction
+	// Check if we have the right operation type (InvokeHostFunction)
+	if tx.Envelope.Type != xdr.EnvelopeTypeEnvelopeTypeTx {
+		return arguments
+	}
+
+	// Get the operations
+	ops := tx.Envelope.Operations()
+	if opIndex >= len(ops) {
+		log.Printf("Operation index %d out of bounds (max: %d)", opIndex, len(ops)-1)
+		return arguments
+	}
+
+	// Get the specific operation
+	op := ops[opIndex]
+
+	// Check if it's an InvokeHostFunction operation
+	if op.Body.Type != xdr.OperationTypeInvokeHostFunction {
+		return arguments
+	}
+
+	// Get the host function
+	invokeHostFunction := op.Body.InvokeHostFunctionOp
+	function := invokeHostFunction.HostFunction
+
+	// Check if it's a contract invocation
+	if function.Type != xdr.HostFunctionTypeHostFunctionTypeInvokeContract {
+		return arguments
+	}
+
+	// Extract the contract invocation details
+	invokeContract := function.MustInvokeContract()
+
+	// Skip the first argument if it's the function name (symbol)
+	startIdx := 0
+	if len(invokeContract.Args) > 0 {
+		if _, ok := invokeContract.Args[0].GetSym(); ok {
+			startIdx = 1
+		}
+	}
+
+	// Process and extract arguments with dual representation
+	for i := startIdx; i < len(invokeContract.Args); i++ {
+		// Use the dual representation for better argument parsing
+		dualRep := serializeScVal(invokeContract.Args[i])
+
+		// Marshal the dual representation to JSON
+		dualRepJson, jsonErr := json.Marshal(dualRep)
+		if jsonErr == nil {
+			arguments = append(arguments, dualRepJson)
+			log.Printf("Extracted argument %d of type %s", i, dualRep.Type)
+		} else {
+			log.Printf("Failed to marshal dual representation for argument %d: %v", i, jsonErr)
+			// Fallback to regular marshaling if dual representation fails
+			if arg, err2 := json.Marshal(invokeContract.Args[i]); err2 == nil {
+				arguments = append(arguments, arg)
+				log.Printf("Extracted argument %d (fallback)", i)
+			} else {
+				log.Printf("Failed to marshal argument %d: %v", i, err2)
+			}
+		}
+	}
+
+	// Also check Soroban meta for additional context
 	if tx.UnsafeMeta.V == 3 {
 		sorobanMeta := tx.UnsafeMeta.V3.SorobanMeta
-		if sorobanMeta != nil {
-			// Based on the debug output, there's no direct arguments field
-			// Arguments would need to be extracted from other transaction data
+		if sorobanMeta != nil && sorobanMeta.Events != nil {
+			// Look for events that might contain additional argument info
+			for _, event := range sorobanMeta.Events {
+				if event.Type == xdr.ContractEventTypeContract && event.Body.V0 != nil {
+					// Check if this is an event for the operation's contract
+					// Skip the first topic (event name) and look for argument-related topics
+					if len(event.Body.V0.Topics) > 1 {
+						// Log the topics for debugging
+						for i, topic := range event.Body.V0.Topics {
+							if i == 0 {
+								// First topic is usually the event name
+								if sym, ok := topic.GetSym(); ok {
+									eventName := string(sym)
+									log.Printf("Found event: %s", eventName)
+								}
+								continue
+							}
 
-			// Process events which may contain argument information
-			if len(sorobanMeta.Events) > 0 {
-				for _, _event := range sorobanMeta.Events {
-					// Process events for arguments
-					// Implementation depends on the structure of ContractEvent
-					_ = _event // Placeholder until implementation is complete
+							// For other topics, check if they might be related to arguments
+							// For now, just log them
+							log.Printf("Event topic %d: %v", i, topic)
+						}
+
+						// Check if event has data that's not empty (all Zero values)
+						emptyScVal := xdr.ScVal{}
+						if event.Body.V0.Data != emptyScVal {
+							log.Printf("Event has data field, might contain additional argument info")
+						}
+					}
 				}
 			}
 		}
@@ -652,10 +1132,6 @@ func (p *ContractInvocationProcessor) extractTemporaryData(
 
 	// Check if we have Soroban meta in the transaction
 	if tx.UnsafeMeta.V == 3 {
-		// First, log the entire meta structure to understand what's available
-		metaBytes, _ := json.Marshal(tx.UnsafeMeta.V3)
-		log.Printf("Transaction meta V3 structure: %s", string(metaBytes))
-
 		// Look for ledger entry changes in the transaction metadata
 		// These are typically in the operations results or in the transaction meta
 		for _, op := range tx.UnsafeMeta.V3.Operations {
@@ -750,9 +1226,11 @@ func (p *ContractInvocationProcessor) extractTemporaryData(
 
 					// Also check for modified entries that might be temporary data
 					if modified, ok := change.GetUpdated(); ok {
-						// Just log for now until implementation is complete
-						log.Printf("Found modified entry, implementation pending")
-						_ = modified // Use the variable to avoid unused error
+						// Process the modified entry
+						if modified.Data.Type == xdr.LedgerEntryTypeContractData {
+							// Log the detection of a modified entry
+							log.Printf("Found modified contract data entry")
+						}
 					}
 				}
 			}
@@ -761,24 +1239,25 @@ func (p *ContractInvocationProcessor) extractTemporaryData(
 		// Also check the Soroban-specific metadata
 		sorobanMeta := tx.UnsafeMeta.V3.SorobanMeta
 		if sorobanMeta != nil {
-			// Log the Soroban meta structure
-			sorobanMetaBytes, _ := json.Marshal(sorobanMeta)
-			log.Printf("Soroban meta structure: %s", string(sorobanMetaBytes))
-
-			// Check for any fields that might contain temporary data information
-			// This depends on the specific structure of SorobanTransactionMeta
-
-			// Example: If there's a ResourceChanges field
-			// if resourceChanges := sorobanMeta.ResourceChanges; resourceChanges != nil {
-			//     // Process resource changes for temporary data
-			//     // ...
-			// }
-
-			// Example: If there's a FootprintChanges field
-			// if footprintChanges := sorobanMeta.FootprintChanges; footprintChanges != nil {
-			//     // Process footprint changes for temporary data
-			//     // ...
-			// }
+			// Check for any temporary data in the events
+			if sorobanMeta.Events != nil {
+				for _, event := range sorobanMeta.Events {
+					if event.Type == xdr.ContractEventTypeContract && event.Body.V0 != nil {
+						// Check for events that might indicate temporary data creation
+						if len(event.Body.V0.Topics) > 0 {
+							if sym, ok := event.Body.V0.Topics[0].GetSym(); ok {
+								eventName := string(sym)
+								// Look for events related to temporary data
+								if strings.Contains(strings.ToLower(eventName), "temp") ||
+									strings.Contains(strings.ToLower(eventName), "cache") ||
+									strings.Contains(strings.ToLower(eventName), "ephemeral") {
+									log.Printf("Found event potentially related to temporary data: %s", eventName)
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -864,8 +1343,12 @@ func (p *ContractInvocationProcessor) processContractInvocation(
 				log.Printf("First argument type: %v", invokeContract.Args[0].Type)
 
 				// Try to marshal the argument to see its structure
-				argBytes, _ := json.Marshal(invokeContract.Args[0])
-				log.Printf("First argument value: %s", string(argBytes))
+				argBytes, err := json.Marshal(invokeContract.Args[0])
+				if err != nil {
+					log.Printf("Error marshaling first argument: %v", err)
+				} else {
+					log.Printf("First argument value: %s", string(argBytes))
+				}
 
 				// Try to extract function name from the function itself if available
 				if invokeContract.FunctionName != "" {
@@ -874,21 +1357,8 @@ func (p *ContractInvocationProcessor) processContractInvocation(
 			}
 		}
 
-		// Extract function arguments
-		// Skip the first argument if it's the function name (symbol)
-		startIdx := 0
-		if len(invokeContract.Args) > 0 {
-			if _, ok := invokeContract.Args[0].GetSym(); ok {
-				startIdx = 1
-			}
-		}
-
-		// Process arguments
-		for i := startIdx; i < len(invokeContract.Args); i++ {
-			if arg, err := json.Marshal(invokeContract.Args[i]); err == nil {
-				arguments = append(arguments, arg)
-			}
-		}
+		// Extract arguments using the dedicated method
+		arguments = p.extractArguments(tx, opIndex)
 	}
 
 	// Check if the operation was successful
@@ -917,7 +1387,7 @@ func (p *ContractInvocationProcessor) processContractInvocation(
 	invocation.Tags["contract_id"] = contractID
 	invocation.Tags["function_name"] = functionName
 	invocation.Tags["successful"] = fmt.Sprintf("%t", successful)
-	invocation.Tags["invoking_account"] = invokingAccountAddress
+	invocation.Tags["ledger"] = fmt.Sprintf("%d", meta.LedgerSequence())
 
 	return invocation, nil
 }
@@ -993,4 +1463,167 @@ func (p *ContractInvocationProcessor) GetQueryDefinitions() string {
 	getContractInvocationsByFunction(contractId: String!, functionName: String!, limit: Int, offset: Int): [ContractInvocation]
 	getContractInvocationsByAccount(account: String!, limit: Int, offset: Int): [ContractInvocation]
 `
+}
+
+// Add these structures after the existing ContractInvocation struct
+
+// DualValue represents both raw and decoded versions of a value
+type DualValue struct {
+	Raw     string          `json:"raw"`     // Raw encoded data
+	Decoded json.RawMessage `json:"decoded"` // Decoded human-readable data
+}
+
+// ScValDualRepresentation stores both raw and decoded versions of a Stellar ScVal
+type ScValDualRepresentation struct {
+	Type      string          `json:"type"`
+	RawValue  string          `json:"raw_value"`
+	Value     json.RawMessage `json:"value"`
+	TypeInt   int32           `json:"type_int,omitempty"`
+	ScValType string          `json:"scval_type,omitempty"`
+}
+
+// serializeScVal converts a Stellar ScVal to its dual representation (raw and decoded)
+func serializeScVal(scVal xdr.ScVal) *ScValDualRepresentation {
+	result := &ScValDualRepresentation{
+		TypeInt:   int32(scVal.Type),
+		ScValType: scVal.Type.String(),
+	}
+
+	// Set the type name based on the ScVal type
+	if scValTypeName, ok := scVal.ArmForSwitch(int32(scVal.Type)); ok {
+		result.Type = scValTypeName
+	} else {
+		result.Type = fmt.Sprintf("unknown_type_%d", scVal.Type)
+	}
+
+	// Get the raw value
+	if raw, err := scVal.MarshalBinary(); err == nil {
+		result.RawValue = base64.StdEncoding.EncodeToString(raw)
+	}
+
+	// Get the decoded value based on type
+	var decodedValue interface{}
+
+	switch scVal.Type {
+	case xdr.ScValTypeScvBool:
+		if val, ok := scVal.GetB(); ok {
+			decodedValue = val
+		}
+	case xdr.ScValTypeScvVoid:
+		decodedValue = nil
+	case xdr.ScValTypeScvU32:
+		if val, ok := scVal.GetU32(); ok {
+			decodedValue = val
+		}
+	case xdr.ScValTypeScvI32:
+		if val, ok := scVal.GetI32(); ok {
+			decodedValue = val
+		}
+	case xdr.ScValTypeScvU64:
+		if val, ok := scVal.GetU64(); ok {
+			decodedValue = val
+		}
+	case xdr.ScValTypeScvI64:
+		if val, ok := scVal.GetI64(); ok {
+			decodedValue = val
+		}
+	case xdr.ScValTypeScvTimepoint:
+		if val, ok := scVal.GetTimepoint(); ok {
+			decodedValue = val
+		}
+	case xdr.ScValTypeScvDuration:
+		if val, ok := scVal.GetDuration(); ok {
+			decodedValue = val
+		}
+	case xdr.ScValTypeScvU128:
+		if val, ok := scVal.GetU128(); ok {
+			// Convert u128 to readable format
+			decodedValue = map[string]interface{}{
+				"hi": val.Hi,
+				"lo": val.Lo,
+			}
+		}
+	case xdr.ScValTypeScvI128:
+		if val, ok := scVal.GetI128(); ok {
+			// Convert i128 to readable format
+			decodedValue = map[string]interface{}{
+				"hi": val.Hi,
+				"lo": val.Lo,
+			}
+		}
+	case xdr.ScValTypeScvBytes:
+		if val, ok := scVal.GetBytes(); ok {
+			// Base64 encode bytes
+			decodedValue = base64.StdEncoding.EncodeToString(val)
+		}
+	case xdr.ScValTypeScvString:
+		if val, ok := scVal.GetStr(); ok {
+			decodedValue = string(val)
+		}
+	case xdr.ScValTypeScvSymbol:
+		if val, ok := scVal.GetSym(); ok {
+			decodedValue = string(val)
+		}
+	case xdr.ScValTypeScvVec:
+		if val, ok := scVal.GetVec(); ok && val != nil {
+			// Process array of values
+			elements := make([]interface{}, 0, len(*val))
+			for _, elem := range *val {
+				elements = append(elements, serializeScVal(elem))
+			}
+			decodedValue = elements
+		}
+	case xdr.ScValTypeScvMap:
+		if val, ok := scVal.GetMap(); ok && val != nil {
+			// Process map of key-value pairs
+			mapResult := make(map[string]interface{})
+			for _, entry := range *val {
+				keyScVal := serializeScVal(entry.Key)
+				valueScVal := serializeScVal(entry.Val)
+
+				// Use the key's string representation as map key if possible
+				keyBytes, _ := json.Marshal(keyScVal)
+				mapResult[string(keyBytes)] = valueScVal
+			}
+			decodedValue = mapResult
+		}
+	case xdr.ScValTypeScvAddress:
+		if val, ok := scVal.GetAddress(); ok {
+			// Convert address to string format
+			switch val.Type {
+			case xdr.ScAddressTypeScAddressTypeAccount:
+				if val.AccountId != nil {
+					if address, err := val.AccountId.GetAddress(); err == nil {
+						decodedValue = map[string]interface{}{
+							"type":    "account",
+							"address": address,
+						}
+					}
+				}
+			case xdr.ScAddressTypeScAddressTypeContract:
+				if val.ContractId != nil {
+					contractID, err := strkey.Encode(strkey.VersionByteContract, val.ContractId[:])
+					if err == nil {
+						decodedValue = map[string]interface{}{
+							"type":        "contract",
+							"contract_id": contractID,
+						}
+					}
+				}
+			}
+		}
+	default:
+		// For other types, use string representation
+		decodedValue = scVal.String()
+	}
+
+	// Marshal the decoded value to JSON
+	if decodedValue != nil {
+		valueBytes, err := json.Marshal(decodedValue)
+		if err == nil {
+			result.Value = valueBytes
+		}
+	}
+
+	return result
 }
